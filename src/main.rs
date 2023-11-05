@@ -63,17 +63,21 @@ async fn main(_spawner: Spawner) {
 
     let mut i2c = i2c::I2c::new_blocking(p.I2C0, scl, sda, i2c::Config::default());
     let calib = bmp280_get_calib(&mut i2c).unwrap();
-    let mut uart_cfg = uart::Config::default();
-    uart_cfg.baudrate = 9600;
-    let mut uart_tx = UartTx::new(p.UART0, p.PIN_16, p.DMA_CH0, uart_cfg);
     bmp280_init(&mut i2c).unwrap();
 
-    // reset display
-    uart_tx.blocking_write(&[0xfe, 0x01]).unwrap();
+    let mut uart_cfg = uart::Config::default();
+
+    // wait some time to have the display booted up
+    Timer::after_secs(1).await;
+
+    uart_cfg.baudrate = 9600;
+    let mut uart_tx = UartTx::new(p.UART0, p.PIN_16, p.DMA_CH0, uart_cfg);
 
     let mut fmt_buf = [0u8; 64];
 
     loop {
+        uart_tx.blocking_write(&[0xfe, 0x0c]).unwrap();
+        // reset display
         let (p, t, h) = bmp280_read_raw(&mut i2c).unwrap();
         let fine = bmp280_convert(t as i32, &calib);
         let temp = bmp280_convert_temp(fine);
