@@ -300,6 +300,7 @@ name = "embassy-embedded-hal"
 version = "0.1.0"
 source = "git+https://github.com/embassy-rs/embassy.git#d6f42eafad5582963a6d4c266f79425ed9b812e0"
 dependencies = [
+ "defmt",
  "embassy-futures",
  "embassy-sync",
  "embassy-time",
@@ -1243,6 +1244,7 @@ dependencies = [
  "cortex-m-rt",
  "defmt",
  "defmt-rtt",
+ "embassy-embedded-hal",
  "embassy-executor",
  "embassy-rp",
  "embassy-time",

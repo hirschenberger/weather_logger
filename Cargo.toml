@@ -5,6 +5,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[profile.release]
+debug = 2
+
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7.3"
@@ -13,6 +16,7 @@ defmt-rtt = "0.4.0"
 embassy-executor = { git = "https://github.com/embassy-rs/embassy.git", version = "0.3.1",features = ["nightly", "arch-cortex-m", "executor-thread", "executor-interrupt", "defmt", "integrated-timers"] }
 embassy-rp = { git = "https://github.com/embassy-rs/embassy.git", version = "0.1.0", features = ["defmt", "unstable-traits", "nightly", "unstable-pac", "time-driver", "critical-section-impl"] }
 embassy-time = { git = "https://github.com/embassy-rs/embassy.git", version = "0.1.5",features = ["nightly", "unstable-traits", "defmt", "defmt-timestamp-uptime"]   }
+embassy-embedded-hal = {  git = "https://github.com/embassy-rs/embassy.git", features = ["defmt"]}
 embedded-hal = "=1.0.0-rc.1"
 format_no_std = "1.0.0"
 panic-probe = { version = "0.3.1", features = ["print-defmt"] }

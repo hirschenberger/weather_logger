@@ -20,6 +20,7 @@ mod bmp2080 {
 
     pub const REG_CONFIG: u8 = 0xf5;
     pub const REG_CTRL_MEAS: u8 = 0xf4;
+    pub const REG_CTRL_HUM: u8 = 0xf2;
     pub const REG_DATA_START: u8 = 0xf7;
 
     pub const P_T_CALIB_VALUES: usize = 26;
@@ -84,10 +85,12 @@ async fn main(_spawner: Spawner) {
         let ts = format_no_std::show(&mut fmt_buf, format_args!("Temp: {:.2}C", temp)).unwrap();
         write_x_y(&mut uart_tx, 5, 0, ts.as_bytes()).unwrap();
 
-        let ts = format_no_std::show(&mut fmt_buf, format_args!("Humidity: {:.2}%RH", hum)).unwrap();
+        let ts =
+            format_no_std::show(&mut fmt_buf, format_args!("Humidity: {:.2}%RH", hum)).unwrap();
         write_x_y(&mut uart_tx, 1, 1, ts.as_bytes()).unwrap();
 
-        let ts = format_no_std::show(&mut fmt_buf, format_args!("Pressure: {:.1}hPa", press)).unwrap();
+        let ts =
+            format_no_std::show(&mut fmt_buf, format_args!("Pressure: {:.1}hPa", press)).unwrap();
         write_x_y(&mut uart_tx, 1, 2, ts.as_bytes()).unwrap();
         Timer::after_secs(3).await;
     }
@@ -174,10 +177,12 @@ fn write_x_y(uart: &mut Uart, x: u8, y: u8, txt: &[u8]) -> Result<(), uart::Erro
 fn bmp280_init(i2c: &mut dyn I2c<Error = i2c::Error>) -> Result<(), i2c::Error> {
     use bmp2080::*;
 
-    // 1000ms sampling time, x16 filter
-    i2c.write(ADDR, &[REG_CONFIG, ((0x05 << 5) | (0x05 << 2)) & 0xfc])?;
-    // osrs_t x1, osrs_p x4, normal mode operation
-    i2c.write(ADDR, &[REG_CTRL_MEAS, (0x01 << 5) | (0x03 << 2) | 0x03])?;
+    // 1000ms sampling time, filter off
+    i2c.write(ADDR, &[REG_CONFIG, (0x05 << 5) | (0x00 << 2)])?;
+    // osrs_h x1 NOTE: Must be wrtten before writing to REG_CTRL_MEAS
+    i2c.write(ADDR, &[REG_CTRL_HUM, 0x01])?;
+    // osrs_t x1, osrs_p x1, normal mode operation
+    i2c.write(ADDR, &[REG_CTRL_MEAS, (0x01 << 5) | (0x01 << 2) | 0x03])?;
 
     Ok(())
 }
