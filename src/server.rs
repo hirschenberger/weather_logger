@@ -1,19 +1,17 @@
 use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_net::{tcp::TcpSocket, Config, ConfigV4, Stack, StackResources};
+use embassy_net::{tcp::TcpSocket, Config, Stack, StackResources};
 use embassy_rp::{
     bind_interrupts,
     gpio::{Level, Output},
-    peripherals::{DMA_CH0, PIN_10, PIN_23, PIN_24, PIN_25, PIO0},
+    peripherals::{DMA_CH0, PIN_23, PIN_24, PIN_25, PIO0},
     pio::{InterruptHandler, Pio},
 };
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, pubsub::Subscriber};
-use embassy_time::{Duration, Timer};
+use embassy_time::Duration;
 use embedded_io_async::Write;
 use static_cell::make_static;
 
-use crate::DataPoint;
 use {defmt_rtt as _, panic_probe as _};
 
 const WIFI_SSID: &str = env!("WIFI_SSID");

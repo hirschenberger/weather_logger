@@ -1,7 +1,3 @@
-//! This example test the RP Pico on board LED.
-//!
-//! It does not work with the RP Pico W board. See wifi_blinky.rs.
-
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
@@ -11,12 +7,12 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::i2c;
 use embassy_rp::uart::{self, Blocking, UartTx};
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
-use embassy_sync::blocking_mutex::NoopMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
 use embassy_sync::pubsub::PubSubChannel;
 use embassy_time::Timer;
 use embedded_hal::i2c::I2c;
-use static_cell::StaticCell;
+
 use {defmt_rtt as _, panic_probe as _};
 
 mod server;
@@ -97,7 +93,7 @@ async fn main(spawner: Spawner) {
 
     let mut fmt_buf = [0u8; 64];
 
-    let mut publisher = CHANNEL.publisher().unwrap();
+    let publisher = CHANNEL.publisher().unwrap();
 
     loop {
         uart_tx.blocking_write(&[0xfe, 0x0c]).unwrap();
