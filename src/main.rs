@@ -11,9 +11,15 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::i2c;
 use embassy_rp::uart::{self, Blocking, UartTx};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_sync::blocking_mutex::NoopMutex;
+use embassy_sync::pubsub::PubSubChannel;
 use embassy_time::Timer;
 use embedded_hal::i2c::I2c;
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
+
+mod server;
 
 mod bmp2080 {
     pub const ADDR: u8 = 0x76;
@@ -52,9 +58,25 @@ mod bmp2080 {
 
 type Uart = UartTx<'static, embassy_rp::peripherals::UART0, Blocking>;
 
+#[derive(Copy, Clone, Debug)]
+struct DataPoint {
+    temp: f32,
+    humidity: f32,
+    pressure: f32,
+}
+
+pub static CHANNEL: PubSubChannel<CriticalSectionRawMutex, DataPoint, 1, 1, 1> =
+    PubSubChannel::<CriticalSectionRawMutex, DataPoint, 1, 1, 1>::new();
+
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    spawner
+        .spawn(server::start(
+            p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.PIO0, p.DMA_CH0,
+        ))
+        .unwrap();
 
     let sda = p.PIN_4;
     let scl = p.PIN_5;
@@ -71,9 +93,11 @@ async fn main(_spawner: Spawner) {
     Timer::after_secs(1).await;
 
     uart_cfg.baudrate = 9600;
-    let mut uart_tx = UartTx::new(p.UART0, p.PIN_16, p.DMA_CH0, uart_cfg);
+    let mut uart_tx = UartTx::new(p.UART0, p.PIN_16, p.DMA_CH1, uart_cfg);
 
     let mut fmt_buf = [0u8; 64];
+
+    let mut publisher = CHANNEL.publisher().unwrap();
 
     loop {
         uart_tx.blocking_write(&[0xfe, 0x0c]).unwrap();
@@ -85,6 +109,12 @@ async fn main(_spawner: Spawner) {
         let hum = bmp280_convert_humidity(h, fine, &calib);
 
         info!("Pressure: {}, Temp: {}, Humidity: {}", press, temp, hum);
+
+        publisher.publish_immediate(DataPoint {
+            temp,
+            humidity: hum,
+            pressure: press,
+        });
 
         let ts = format_no_std::show(&mut fmt_buf, format_args!("Temp: {:.2}C", temp)).unwrap();
         write_x_y(&mut uart_tx, 5, 0, ts.as_bytes()).unwrap();
@@ -182,7 +212,7 @@ fn bmp280_init(i2c: &mut dyn I2c<Error = i2c::Error>) -> Result<(), i2c::Error> 
     use bmp2080::*;
 
     // 1000ms sampling time, filter off
-    i2c.write(ADDR, &[REG_CONFIG, (0x05 << 5) | (0x00 << 2)])?;
+    i2c.write(ADDR, &[REG_CONFIG, (0x05 << 5)])?;
     // osrs_h x1 NOTE: Must be wrtten before writing to REG_CTRL_MEAS
     i2c.write(ADDR, &[REG_CTRL_HUM, 0x01])?;
     // osrs_t x1, osrs_p x1, normal mode operation
