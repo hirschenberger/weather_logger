@@ -5,8 +5,11 @@
 use bmp2080::Calib;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_rp::i2c;
-use embassy_rp::uart::{self, Blocking, UartTx};
+use embassy_rp::{
+    adc,
+    uart::{self, Blocking, UartTx},
+};
+use embassy_rp::{bind_interrupts, i2c};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 use embassy_sync::pubsub::PubSubChannel;
@@ -55,39 +58,45 @@ mod bmp2080 {
 type Uart = UartTx<'static, embassy_rp::peripherals::UART0, Blocking>;
 
 #[derive(Copy, Clone, Debug)]
-struct DataPoint {
+pub struct DataPoint {
     temp: f32,
     humidity: f32,
     pressure: f32,
+    co: u16,
 }
 
 pub static CHANNEL: PubSubChannel<CriticalSectionRawMutex, DataPoint, 1, 1, 1> =
     PubSubChannel::<CriticalSectionRawMutex, DataPoint, 1, 1, 1>::new();
 
+bind_interrupts!(struct Irqs {
+    ADC_IRQ_FIFO => adc::InterruptHandler;
+});
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    spawner
-        .spawn(server::start(
-            p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.PIO0, p.DMA_CH0,
-        ))
-        .unwrap();
+    info!("Starting webserver");
+    spawner.must_spawn(server::start(
+        p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.PIO0, p.DMA_CH0,
+    ));
 
+    info!("Setup analog in for CO sensor");
+    let mut adc = adc::Adc::new(p.ADC, Irqs, Default::default());
+    let mut co_chan = adc::Channel::new_pin(p.PIN_26, embassy_rp::gpio::Pull::None);
+
+    info!("Setup i2c for humidity, temp and pressure sensor");
     let sda = p.PIN_4;
     let scl = p.PIN_5;
-
-    info!("Setup i2c");
-
     let mut i2c = i2c::I2c::new_blocking(p.I2C0, scl, sda, i2c::Config::default());
     let calib = bmp280_get_calib(&mut i2c).unwrap();
     bmp280_init(&mut i2c).unwrap();
 
-    let mut uart_cfg = uart::Config::default();
-
     // wait some time to have the display booted up
     Timer::after_secs(1).await;
 
+    info!("Setup UART display comm");
+    let mut uart_cfg = uart::Config::default();
     uart_cfg.baudrate = 9600;
     let mut uart_tx = UartTx::new(p.UART0, p.PIN_16, p.DMA_CH1, uart_cfg);
 
@@ -103,13 +112,18 @@ async fn main(spawner: Spawner) {
         let temp = bmp280_convert_temp(fine);
         let press = bmp280_convert_pressure(p, fine, &calib);
         let hum = bmp280_convert_humidity(h, fine, &calib);
+        let co = adc.read(&mut co_chan).await.unwrap();
 
-        info!("Pressure: {}, Temp: {}, Humidity: {}", press, temp, hum);
+        info!(
+            "Pressure: {}, Temp: {}, Humidity: {}, CO: {}",
+            press, temp, hum, co
+        );
 
         publisher.publish_immediate(DataPoint {
             temp,
             humidity: hum,
             pressure: press,
+            co,
         });
 
         let ts = format_no_std::show(&mut fmt_buf, format_args!("Temp: {:.2}C", temp)).unwrap();
