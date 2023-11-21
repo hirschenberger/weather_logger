@@ -2,18 +2,21 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
+use core::cell::RefCell;
+
 use bmp2080::Calib;
+use ccs811::Ccs811Awake;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::{
-    adc,
+    adc, gpio, pwm,
     uart::{self, Blocking, UartTx},
 };
 use embassy_rp::{bind_interrupts, i2c};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
 
-use embassy_sync::pubsub::PubSubChannel;
-use embassy_time::Timer;
+use embassy_time::{Delay, Timer};
+use embedded_ccs811::{self as ccs811, nb, prelude::*};
 use embedded_hal::i2c::I2c;
 
 use {defmt_rtt as _, panic_probe as _};
@@ -63,14 +66,16 @@ pub struct DataPoint {
     humidity: f32,
     pressure: f32,
     co: u16,
+    co2: u16,
+    tvoc: u16,
 }
-
-pub static CHANNEL: PubSubChannel<CriticalSectionRawMutex, DataPoint, 1, 1, 1> =
-    PubSubChannel::<CriticalSectionRawMutex, DataPoint, 1, 1, 1>::new();
 
 bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => adc::InterruptHandler;
 });
+
+pub static DATA_POINT: Mutex<ThreadModeRawMutex, RefCell<Option<DataPoint>>> =
+    Mutex::new(RefCell::new(None));
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -81,16 +86,26 @@ async fn main(spawner: Spawner) {
         p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.PIO0, p.DMA_CH0,
     ));
 
-    info!("Setup analog in for CO sensor");
+    info!("Setup analog in and pwm current control for CO sensor");
     let mut adc = adc::Adc::new(p.ADC, Irqs, Default::default());
     let mut co_chan = adc::Channel::new_pin(p.PIN_26, embassy_rp::gpio::Pull::None);
+    let mut co_conf = pwm::Config::default();
+    co_conf.top = 100;
+    co_conf.compare_b = 100;
+    let mut _co_pwm = pwm::Pwm::new_output_b(p.PWM_CH0, p.PIN_17, co_conf.clone());
 
     info!("Setup i2c for humidity, temp and pressure sensor");
-    let sda = p.PIN_4;
-    let scl = p.PIN_5;
-    let mut i2c = i2c::I2c::new_blocking(p.I2C0, scl, sda, i2c::Config::default());
-    let calib = bmp280_get_calib(&mut i2c).unwrap();
-    bmp280_init(&mut i2c).unwrap();
+    let mut temp_i2c = i2c::I2c::new_blocking(p.I2C0, p.PIN_5, p.PIN_4, i2c::Config::default());
+    let calib = bmp280_get_calib(&mut temp_i2c).unwrap();
+    bmp280_init(&mut temp_i2c).unwrap();
+
+    info!("Setup i2c for CO2 and VOC sensor");
+    let co2_i2c = i2c::I2c::new_blocking(p.I2C1, p.PIN_15, p.PIN_14, i2c::Config::default());
+    let ccs811 = ccs811::Ccs811Awake::new(co2_i2c, ccs811::SlaveAddr::default());
+    let mut ccs811 = ccs811.start_application().ok().unwrap();
+    ccs811
+        .set_mode(ccs811::MeasurementMode::ConstantPower1s)
+        .unwrap();
 
     // wait some time to have the display booted up
     Timer::after_secs(1).await;
@@ -102,29 +117,36 @@ async fn main(spawner: Spawner) {
 
     let mut fmt_buf = [0u8; 64];
 
-    let publisher = CHANNEL.publisher().unwrap();
-
     loop {
         uart_tx.blocking_write(&[0xfe, 0x0c]).unwrap();
         // reset display
-        let (p, t, h) = bmp280_read_raw(&mut i2c).unwrap();
+        let (p, t, h) = bmp280_read_raw(&mut temp_i2c).unwrap();
         let fine = bmp280_convert(t as i32, &calib);
         let temp = bmp280_convert_temp(fine);
         let press = bmp280_convert_pressure(p, fine, &calib);
         let hum = bmp280_convert_humidity(h, fine, &calib);
         let co = adc.read(&mut co_chan).await.unwrap();
 
+        ccs811.set_environment(hum, temp).unwrap();
+
+        let co2_tvoc = nb::block!(ccs811.data()).unwrap();
+
         info!(
-            "Pressure: {}, Temp: {}, Humidity: {}, CO: {}",
-            press, temp, hum, co
+            "Pressure: {}, Temp: {}, Humidity: {}, CO: {}, CO2: {}, TVAC: {}",
+            press, temp, hum, co, co2_tvoc.eco2, co2_tvoc.etvoc
         );
 
-        publisher.publish_immediate(DataPoint {
-            temp,
-            humidity: hum,
-            pressure: press,
-            co,
-        });
+        {
+            let lock = DATA_POINT.lock().await;
+            lock.replace(Some(DataPoint {
+                temp,
+                humidity: hum,
+                pressure: press,
+                co,
+                co2: co2_tvoc.eco2,
+                tvoc: co2_tvoc.etvoc,
+            }));
+        }
 
         let ts = format_no_std::show(&mut fmt_buf, format_args!("Temp: {:.2}C", temp)).unwrap();
         write_x_y(&mut uart_tx, 5, 0, ts.as_bytes()).unwrap();

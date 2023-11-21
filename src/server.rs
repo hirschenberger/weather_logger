@@ -8,7 +8,7 @@ use embassy_rp::{
     peripherals::{DMA_CH0, PIN_23, PIN_24, PIN_25, PIO0},
     pio::{InterruptHandler, Pio},
 };
-use embassy_time::Duration;
+
 use embedded_io_async::Write;
 use static_cell::make_static;
 
@@ -60,92 +60,97 @@ pub async fn start(
     let mut pio = Pio::new(pio0, Irqs);
     let spi = PioSpi::new(&mut pio.common, pio.sm0, pio.irq0, cs, p24, p29, dma_ch0);
 
-    'reconnect: loop {
-        let state = make_static!(cyw43::State::new());
-        let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-        Spawner::for_current_executor()
-            .await
-            .must_spawn(wifi_task(runner));
+    let state = make_static!(cyw43::State::new());
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+    Spawner::for_current_executor()
+        .await
+        .must_spawn(wifi_task(runner));
 
-        control.init(clm).await;
-        control
-            .set_power_management(cyw43::PowerManagementMode::Performance)
-            .await;
+    control.init(clm).await;
+    control
+        .set_power_management(cyw43::PowerManagementMode::Performance)
+        .await;
 
-        let config = Config::dhcpv4(Default::default());
-        let seed = 0x635424974f;
+    let config = Config::dhcpv4(Default::default());
+    let seed = 0x635424974f;
 
-        let stack = &*make_static!(Stack::new(
-            net_device,
-            config,
-            make_static!(StackResources::<4>::new()),
-            seed
-        ));
+    let stack = &*make_static!(Stack::new(
+        net_device,
+        config,
+        make_static!(StackResources::<4>::new()),
+        seed
+    ));
 
-        Spawner::for_current_executor()
-            .await
-            .must_spawn(net_task(stack));
+    Spawner::for_current_executor()
+        .await
+        .must_spawn(net_task(stack));
 
-        loop {
-            match control.join_wpa2(WIFI_SSID, WIFI_PASS).await {
-                Ok(_) => {
-                    info!("Connected to {}", WIFI_SSID);
-                    break;
-                }
-                Err(err) => error!("Can't connect: {}", err.status),
+    loop {
+        match control.join_wpa2(WIFI_SSID, WIFI_PASS).await {
+            Ok(_) => {
+                info!("Connected to {}", WIFI_SSID);
+                break;
             }
+            Err(err) => error!("Can't connect: {}", err.status),
         }
+    }
 
-        info!("Waiting fpr DHCP");
-        stack.wait_config_up().await;
-        info!("DHCP is up");
+    info!("Waiting fpr DHCP");
+    stack.wait_config_up().await;
+    info!("DHCP is up");
 
-        let mut rx_buffer = [0; 1];
-        let mut tx_buffer = [0; 4096];
-        let mut prom_buf = [0; 4096];
-        let mut http_buf = [0; 4096];
+    let mut rx_buffer = [0; 1];
+    let mut tx_buffer = [0; 4096];
+    let mut prom_buf = [0; 4096];
+    let mut http_buf = [0; 4096];
 
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        loop {
-            info!("Socket state: {:?}", socket.state());
-            control.gpio_set(0, false).await;
-            info!("Listening on TCP:1234");
-            if let Err(e) = socket.accept(1234).await {
-                warn!("Accept error: {:?}", e);
+    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    loop {
+        info!("Socket state: {:?}", socket.state());
+        control.gpio_set(0, false).await;
+        info!("Listening on TCP:1234");
+        if let Err(e) = socket.accept(1234).await {
+            warn!("Accept error: {:?}", e);
+            continue;
+        }
+        control.gpio_set(0, true).await;
+
+        info!("Received connection from {:?}", socket.remote_endpoint());
+
+        // let mut subscriber = crate::CHANNEL.subscriber().unwrap();
+        let prometheus_ex = {
+            let lock = crate::DATA_POINT.lock().await;
+            let maybe_data = lock.borrow();
+            if let Some(data) = *maybe_data {
+                //subscriber.next_message_pure().await;
+                format_no_std::show(
+                    &mut prom_buf,
+                    format_args!(
+                        "humidity {:.2}\ntemperature {:.2}\npressure {:.2}\nco {}\nco2 {}\ntvac {}\n",
+                        data.humidity, data.temp, data.pressure, data.co, data.co2, data.tvoc
+                    ),
+                )
+                .unwrap()
+            } else {
                 continue;
             }
-            control.gpio_set(0, true).await;
+        };
 
-            info!("Received connection from {:?}", socket.remote_endpoint());
+        let http = format_no_std::show(
+            &mut http_buf,
+            format_args!(
+                "HTTP/1.1 200 OK\nContent-Length: {}\nContent-Type: text/plain\n\n{}",
+                prometheus_ex.len(),
+                prometheus_ex
+            ),
+        )
+        .unwrap();
 
-            let mut subscriber = crate::CHANNEL.subscriber().unwrap();
-
-            let data = subscriber.next_message_pure().await;
-            let prometheus_ex = format_no_std::show(
-                &mut prom_buf,
-                format_args!(
-                    "humidity {:.2}\ntemperature {:.2}\npressure {:.2}\nco {}",
-                    data.humidity, data.temp, data.pressure, data.co
-                ),
-            )
-            .unwrap();
-
-            let http = format_no_std::show(
-                &mut http_buf,
-                format_args!(
-                    "HTTP/1.1 200 OK\nContent-Length: {}\nContent-Type: text/plain\n\n{}",
-                    prometheus_ex.len(),
-                    prometheus_ex
-                ),
-            )
-            .unwrap();
-
-            if let Err(e) = socket.write_all(http.as_bytes()).await {
-                warn!("Send error: {:?}", e);
-                break 'reconnect;
-            }
-            socket.flush().await.unwrap();
-            socket.abort();
+        if let Err(e) = socket.write_all(http.as_bytes()).await {
+            error!("Send error: {:?}", e);
         }
+
+        socket.flush().await.unwrap();
+        socket.abort();
     }
 }

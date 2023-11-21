@@ -20,6 +20,7 @@ embassy-embedded-hal = {  git = "https://github.com/embassy-rs/embassy.git", fea
 embassy-net = {git = "https://github.com/embassy-rs/embassy.git",  features = ["defmt", "nightly", "tcp", "dhcpv4", "medium-ethernet"] }
 cyw43 = {  git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "firmware-logs"]}
 cyw43-pio = {  git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "overclock"]}
+embedded-ccs811 = { git = "https://github.com/eldruin/embedded-ccs811-rs.git" }
 
 embedded-hal = "=1.0.0-rc.1"
 embedded-io-async = { version = "0.6.0", features = ["defmt-03"] }
@@ -29,3 +30,5 @@ static_cell = { version = "2.0.0", features = ["nightly"]}
 portable-atomic = { version = "1.5.1", features = ["critical-section"] }
 lite-json = { version = "0.2.0", default-features = false }
 embassy-sync = { version = "0.4.0", features = ["nightly", "defmt"] }
+typenum = "1.17.0"
+fixed = "1.24.0"
