@@ -2,10 +2,8 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
-use core::cell::RefCell;
+use core::{cell::RefCell, convert::Infallible};
 
-use bmp2080::Calib;
-use ccs811::Ccs811Awake;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::{
@@ -15,48 +13,14 @@ use embassy_rp::{
 use embassy_rp::{bind_interrupts, i2c};
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
 
-use embassy_time::{Delay, Timer};
+use embassy_time::Timer;
 use embedded_ccs811::{self as ccs811, nb, prelude::*};
-use embedded_hal::i2c::I2c;
+use embedded_hal as hal;
 
 use {defmt_rtt as _, panic_probe as _};
 
+mod bmp280;
 mod server;
-
-mod bmp2080 {
-    pub const ADDR: u8 = 0x76;
-
-    pub const REG_CONFIG: u8 = 0xf5;
-    pub const REG_CTRL_MEAS: u8 = 0xf4;
-    pub const REG_CTRL_HUM: u8 = 0xf2;
-    pub const REG_DATA_START: u8 = 0xf7;
-
-    pub const P_T_CALIB_VALUES: usize = 26;
-    pub const P_T_CALIB_DATA_START: u8 = 0x88;
-    pub const H_CALIB_VALUES: usize = 7;
-    pub const H_CALIB_DATA_START: u8 = 0xe1;
-
-    pub struct Calib {
-        pub t1: u32,
-        pub t2: i32,
-        pub t3: i32,
-        pub p1: u64,
-        pub p2: i64,
-        pub p3: i64,
-        pub p4: i64,
-        pub p5: i64,
-        pub p6: i64,
-        pub p7: i64,
-        pub p8: i64,
-        pub p9: i64,
-        pub h1: u32,
-        pub h2: i32,
-        pub h3: u32,
-        pub h4: i32,
-        pub h5: i32,
-        pub h6: i32,
-    }
-}
 
 type Uart = UartTx<'static, embassy_rp::peripherals::UART0, Blocking>;
 
@@ -68,6 +32,13 @@ pub struct DataPoint {
     co: u16,
     co2: u16,
     tvoc: u16,
+}
+
+mod alarm_thresholds {
+    pub const HUMIDITY: f32 = 70.0;
+    pub const CO: u16 = 200;
+    pub const CO2: u16 = 1000;
+    pub const TVOC: u16 = 400;
 }
 
 bind_interrupts!(struct Irqs {
@@ -96,8 +67,8 @@ async fn main(spawner: Spawner) {
 
     info!("Setup i2c for humidity, temp and pressure sensor");
     let mut temp_i2c = i2c::I2c::new_blocking(p.I2C0, p.PIN_5, p.PIN_4, i2c::Config::default());
-    let calib = bmp280_get_calib(&mut temp_i2c).unwrap();
-    bmp280_init(&mut temp_i2c).unwrap();
+    let calib = bmp280::get_calib(&mut temp_i2c).unwrap();
+    bmp280::init(&mut temp_i2c).unwrap();
 
     info!("Setup i2c for CO2 and VOC sensor");
     let co2_i2c = i2c::I2c::new_blocking(p.I2C1, p.PIN_15, p.PIN_14, i2c::Config::default());
@@ -106,6 +77,12 @@ async fn main(spawner: Spawner) {
     ccs811
         .set_mode(ccs811::MeasurementMode::ConstantPower1s)
         .unwrap();
+
+    info!("Setup alarm LEDs");
+    let mut co_alarm = gpio::Output::new(p.PIN_9, gpio::Level::Low);
+    let mut co2_alarm = gpio::Output::new(p.PIN_7, gpio::Level::Low);
+    let mut hum_alarm = gpio::Output::new(p.PIN_6, gpio::Level::Low);
+    let mut tvoc_alarm = gpio::Output::new(p.PIN_8, gpio::Level::Low);
 
     // wait some time to have the display booted up
     Timer::after_secs(1).await;
@@ -120,117 +97,69 @@ async fn main(spawner: Spawner) {
     loop {
         uart_tx.blocking_write(&[0xfe, 0x0c]).unwrap();
         // reset display
-        let (p, t, h) = bmp280_read_raw(&mut temp_i2c).unwrap();
-        let fine = bmp280_convert(t as i32, &calib);
-        let temp = bmp280_convert_temp(fine);
-        let press = bmp280_convert_pressure(p, fine, &calib);
-        let hum = bmp280_convert_humidity(h, fine, &calib);
         let co = adc.read(&mut co_chan).await.unwrap();
 
-        ccs811.set_environment(hum, temp).unwrap();
+        let bmp280_res = bmp280::read(&mut temp_i2c, &calib).unwrap();
+
+        ccs811
+            .set_environment(bmp280_res.humidity, bmp280_res.temperature)
+            .unwrap();
 
         let co2_tvoc = nb::block!(ccs811.data()).unwrap();
 
         info!(
-            "Pressure: {}, Temp: {}, Humidity: {}, CO: {}, CO2: {}, TVAC: {}",
-            press, temp, hum, co, co2_tvoc.eco2, co2_tvoc.etvoc
+            "{:?}, CO: {}, CO2: {}, TVAC: {}",
+            defmt::Debug2Format(&bmp280_res),
+            co,
+            co2_tvoc.eco2,
+            co2_tvoc.etvoc
         );
+
+        let dp = DataPoint {
+            temp: bmp280_res.temperature,
+            humidity: bmp280_res.humidity,
+            pressure: bmp280_res.pressure,
+            co,
+            co2: co2_tvoc.eco2,
+            tvoc: co2_tvoc.etvoc,
+        };
+
+        check_alarms(
+            &dp,
+            &mut co_alarm,
+            &mut co2_alarm,
+            &mut hum_alarm,
+            &mut tvoc_alarm,
+        )
+        .unwrap();
 
         {
             let lock = DATA_POINT.lock().await;
-            lock.replace(Some(DataPoint {
-                temp,
-                humidity: hum,
-                pressure: press,
-                co,
-                co2: co2_tvoc.eco2,
-                tvoc: co2_tvoc.etvoc,
-            }));
+            lock.replace(Some(dp));
         }
 
-        let ts = format_no_std::show(&mut fmt_buf, format_args!("Temp: {:.2}C", temp)).unwrap();
+        let ts = format_no_std::show(
+            &mut fmt_buf,
+            format_args!("Temp: {:.2}C", bmp280_res.temperature),
+        )
+        .unwrap();
         write_x_y(&mut uart_tx, 5, 0, ts.as_bytes()).unwrap();
 
-        let ts =
-            format_no_std::show(&mut fmt_buf, format_args!("Humidity: {:.2}%RH", hum)).unwrap();
+        let ts = format_no_std::show(
+            &mut fmt_buf,
+            format_args!("Humidity: {:.2}%RH", bmp280_res.humidity),
+        )
+        .unwrap();
         write_x_y(&mut uart_tx, 1, 1, ts.as_bytes()).unwrap();
 
-        let ts =
-            format_no_std::show(&mut fmt_buf, format_args!("Pressure: {:.1}hPa", press)).unwrap();
+        let ts = format_no_std::show(
+            &mut fmt_buf,
+            format_args!("Pressure: {:.1}hPa", bmp280_res.pressure),
+        )
+        .unwrap();
         write_x_y(&mut uart_tx, 1, 2, ts.as_bytes()).unwrap();
         Timer::after_secs(3).await;
     }
-}
-
-fn bmp280_get_calib(i2c: &mut dyn I2c<Error = i2c::Error>) -> Result<bmp2080::Calib, i2c::Error> {
-    use bmp2080::*;
-    let mut p_t_buf = [0; P_T_CALIB_VALUES];
-    i2c.write_read(ADDR, &[P_T_CALIB_DATA_START], &mut p_t_buf)?;
-    let mut h_buf = [0; H_CALIB_VALUES];
-    i2c.write_read(ADDR, &[H_CALIB_DATA_START], &mut h_buf)?;
-    let calib = Calib {
-        t1: (p_t_buf[1] as u32) << 8 | p_t_buf[0] as u32,
-        t2: (p_t_buf[3] as i32) << 8 | p_t_buf[2] as i32,
-        t3: (p_t_buf[5] as i32) << 8 | p_t_buf[4] as i32,
-        p1: (p_t_buf[7] as u64) << 8 | p_t_buf[6] as u64,
-        p2: (p_t_buf[9] as i64) << 8 | p_t_buf[8] as i64,
-        p3: (p_t_buf[11] as i64) << 8 | p_t_buf[10] as i64,
-        p4: (p_t_buf[13] as i64) << 8 | p_t_buf[12] as i64,
-        p5: (p_t_buf[15] as i64) << 8 | p_t_buf[14] as i64,
-        p6: (p_t_buf[17] as i64) << 8 | p_t_buf[16] as i64,
-        p7: (p_t_buf[19] as i64) << 8 | p_t_buf[18] as i64,
-        p8: (p_t_buf[21] as i64) << 8 | p_t_buf[20] as i64,
-        p9: (p_t_buf[23] as i64) << 8 | p_t_buf[22] as i64,
-        h1: (p_t_buf[25] as u32),
-        h2: (h_buf[1] as i32) << 8 | p_t_buf[0] as i32,
-        h3: (h_buf[2] as u32),
-        h4: ((h_buf[3] as i32) << 4) | (h_buf[4] as i32 & 0x0f),
-        h5: ((h_buf[5] as i32) << 4) | ((h_buf[4] as i32 >> 4) | 0x0f),
-        h6: h_buf[6] as i32,
-    };
-    Ok(calib)
-}
-
-fn bmp280_convert(temp: i32, calib: &Calib) -> i32 {
-    let var1 = temp as f32 / 16384.0 - calib.t1 as f32 / 1024.0;
-    let var1 = var1 * calib.t2 as f32;
-    let var2 = temp as f32 / 131072.0 - calib.t1 as f32 / 8192.0;
-    let var2 = var2 * var2 * calib.t3 as f32;
-
-    (var1 + var2) as i32
-}
-
-fn bmp280_convert_temp(fine: i32) -> f32 {
-    fine as f32 / 5120.0
-}
-
-fn bmp280_convert_pressure(press: u32, fine: i32, calib: &Calib) -> f32 {
-    let var1 = fine as f32 / 2.0 - 64000.0;
-    let var2 = var1 * var1 * calib.p6 as f32 / 32768.0;
-    let var2 = var2 + var1 * calib.p5 as f32 * 2.0;
-    let var2 = var2 / 4.0 + calib.p4 as f32 * 65536.0;
-    let var3 = calib.p3 as f32 * var1 * var1 / 524288.0;
-    let var1 = (var3 + calib.p2 as f32 * var1) / 524288.0;
-    let var1 = (1.0 + var1 / 32768.0) * calib.p1 as f32;
-    let pressure = 1048576.0 - press as f32;
-    let pressure = (pressure - (var2 / 4096.0)) * 6250.0 / var1;
-    let var1 = calib.p9 as f32 * pressure * pressure / 2147483648.0;
-    let var2 = pressure * calib.p8 as f32 / 32768.0;
-    let pressure = pressure + (var1 + var2 + calib.p7 as f32) / 16.0;
-    pressure / 100.0
-}
-
-fn bmp280_convert_humidity(hum: u32, fine: i32, calib: &Calib) -> f32 {
-    let var1 = fine as f32 - 76800.0;
-    let var2 = calib.h4 as f32 * 64.0 + (calib.h5 as f32 / 16384.0) * var1;
-    let var3 = hum as f32 - var2;
-    let var4 = calib.h2 as f32 / 65536.0;
-    let var5 = 1.0 + (calib.h3 as f32 / 67108864.0) * var1;
-    let var6 = 1.0 + (calib.h6 as f32 / 67108864.0) * var1 * var5;
-    let var6 = var3 * var4 * var5 * var6;
-
-    let humidity = var6 * (1.0 - calib.h1 as f32 * var6 / 524288.0);
-    humidity.max(0.0).min(100.0)
 }
 
 fn write_x_y(uart: &mut Uart, x: u8, y: u8, txt: &[u8]) -> Result<(), uart::Error> {
@@ -240,28 +169,39 @@ fn write_x_y(uart: &mut Uart, x: u8, y: u8, txt: &[u8]) -> Result<(), uart::Erro
     Ok(())
 }
 
-fn bmp280_init(i2c: &mut dyn I2c<Error = i2c::Error>) -> Result<(), i2c::Error> {
-    use bmp2080::*;
+fn check_alarms<E: hal::digital::Error>(
+    data: &DataPoint,
+    co: &mut dyn hal::digital::OutputPin<Error = E>,
+    co2: &mut dyn hal::digital::OutputPin<Error = E>,
+    hum: &mut dyn hal::digital::OutputPin<Error = E>,
+    tvoc: &mut dyn hal::digital::OutputPin<Error = E>,
+) -> Result<bool, Infallible> {
+    let mut any_alarm = false;
 
-    // 1000ms sampling time, filter off
-    i2c.write(ADDR, &[REG_CONFIG, (0x05 << 5)])?;
-    // osrs_h x1 NOTE: Must be wrtten before writing to REG_CTRL_MEAS
-    i2c.write(ADDR, &[REG_CTRL_HUM, 0x01])?;
-    // osrs_t x1, osrs_p x1, normal mode operation
-    i2c.write(ADDR, &[REG_CTRL_MEAS, (0x01 << 5) | (0x01 << 2) | 0x03])?;
+    if data.co > alarm_thresholds::CO {
+        co.set_high().unwrap();
+        any_alarm = true;
+    } else {
+        co.set_low().unwrap();
+    }
+    if data.co > alarm_thresholds::CO2 {
+        co2.set_high().unwrap();
+        any_alarm = true;
+    } else {
+        co2.set_low().unwrap();
+    }
+    if data.humidity > alarm_thresholds::HUMIDITY {
+        hum.set_high().unwrap();
+        any_alarm = true;
+    } else {
+        hum.set_low().unwrap();
+    }
+    if data.tvoc > alarm_thresholds::TVOC {
+        tvoc.set_high().unwrap();
+        any_alarm = true;
+    } else {
+        tvoc.set_low().unwrap();
+    }
 
-    Ok(())
-}
-
-fn bmp280_read_raw(i2c: &mut dyn I2c<Error = i2c::Error>) -> Result<(u32, u32, u32), i2c::Error> {
-    use bmp2080::*;
-
-    let mut buf = [0; 8];
-    i2c.write_read(ADDR, &[REG_DATA_START], &mut buf)?;
-
-    let pressure = ((buf[0] as u32) << 12) | ((buf[1] as u32) << 4) | ((buf[2] as u32) >> 4);
-    let temp = ((buf[3] as u32) << 12) | ((buf[4] as u32) << 4) | ((buf[5] as u32) >> 4);
-    let hum = ((buf[6] as u32) << 8) | (buf[7] as u32);
-
-    Ok((pressure, temp, hum))
+    Ok(any_alarm)
 }
